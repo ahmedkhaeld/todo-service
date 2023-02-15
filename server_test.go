@@ -1,12 +1,24 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	todo "github.com/ahmedkhaeld/cli-todo"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 )
+
+func TestMain(m *testing.M) {
+	log.SetOutput(io.Discard)
+	//setup
+	os.Exit(m.Run())
+}
 
 func TestGet(t *testing.T) {
 	testCases := []struct {
@@ -17,23 +29,28 @@ func TestGet(t *testing.T) {
 		expContent string
 	}{
 		{name: "GetRoot", path: "/", expCode: http.StatusOK, expContent: content},
-		{name: "NotFound", path: "/api/500", expCode: http.StatusNotFound},
+		{name: "GetAllTodo", path: "/todo", expCode: http.StatusOK, expItems: 2, expContent: "Task number 1."},
+		{name: "GetOneTodo", path: "/todo/1", expCode: http.StatusOK, expItems: 1, expContent: "Task number 1."},
+		{name: "NotFound", path: "/todo/500", expCode: http.StatusNotFound},
 	}
 
 	url, cleanup := setupAPI(t)
-	//test url :=  http://127.0.0.1:37377
 	defer cleanup()
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+
 			var (
+				resp struct {
+					Results      todo.List `json:"results"`
+					Date         int64     `json:"date"`
+					TotalResults int       `json:"total_results"`
+				}
 				body []byte
 				err  error
 			)
 
 			//append the test path to the test server url
-			//http://127.0.0.1:37377/  --> expCode: ok
-			//http://127.0.0.1:37377/api/500 --> expCode: not found
 			w, err := http.Get(url + tc.path)
 			if err != nil {
 				t.Error(err)
@@ -44,12 +61,19 @@ func TestGet(t *testing.T) {
 					t.Error(err)
 				}
 			}(w.Body)
-
 			if w.StatusCode != tc.expCode {
 				t.Fatalf("Expected %q, got %q.", http.StatusText(tc.expCode), http.StatusText(w.StatusCode))
 			}
 
 			switch {
+			case strings.Contains(w.Header.Get("Content-Type"), "application/json"):
+				if err = json.NewDecoder(w.Body).Decode(&resp); err != nil {
+					t.Error(err)
+				}
+				if resp.TotalResults != tc.expItems {
+					t.Errorf("Expected %d, got %d.", tc.expItems, resp.TotalResults)
+				}
+
 			case strings.Contains(w.Header.Get("Content-Type"), "text/plain"):
 				if body, err = io.ReadAll(w.Body); err != nil {
 					t.Error(err)
@@ -65,13 +89,196 @@ func TestGet(t *testing.T) {
 	}
 }
 
+func TestAdd(t *testing.T) {
+	url, cleanup := setupAPI(t)
+	defer cleanup()
+
+	taskName := "Task number 3."
+	t.Run("Add", func(t *testing.T) {
+		var body bytes.Buffer
+		item := struct {
+			Task string `json:"task"`
+		}{
+			Task: taskName,
+		}
+
+		if err := json.NewEncoder(&body).Encode(item); err != nil {
+			t.Fatal(err)
+		}
+
+		rw, err := http.Post(url+"/todo", "application/json", &body)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if rw.StatusCode != http.StatusCreated {
+			t.Errorf("Expected %q, got %q.", http.StatusText(http.StatusCreated), http.StatusText(rw.StatusCode))
+		}
+	})
+
+	t.Run("CheckAdd", func(t *testing.T) {
+		rw, err := http.Get(url + "/todo/3")
+		if err != nil {
+			t.Error(err)
+		}
+
+		if rw.StatusCode != http.StatusOK {
+			t.Fatalf("Expected %q, got %q.", http.StatusText(http.StatusOK), http.StatusText(rw.StatusCode))
+		}
+
+		var resp todoResponse
+		if err := json.NewDecoder(rw.Body).Decode(&resp); err != nil {
+			t.Fatal(err)
+		}
+		rw.Body.Close()
+
+		if resp.Results[0].Task != taskName {
+			t.Errorf("Expected %q, got %q.", taskName, resp.Results[0].Task)
+		}
+	})
+}
+
+func TestDelete(t *testing.T) {
+	url, cleanup := setupAPI(t)
+	defer cleanup()
+
+	t.Run("Delete", func(t *testing.T) {
+		u := fmt.Sprintf("%s/todo/1", url)
+		req, err := http.NewRequest(http.MethodDelete, u, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		r, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Error(err)
+		}
+
+		if r.StatusCode != http.StatusNoContent {
+			t.Fatalf("Expected %q, got %q.",
+				http.StatusText(http.StatusNoContent), http.StatusText(r.StatusCode))
+		}
+	})
+
+	t.Run("CheckDelete", func(t *testing.T) {
+		r, err := http.Get(url + "/todo")
+		if err != nil {
+			t.Error(err)
+		}
+
+		if r.StatusCode != http.StatusOK {
+			t.Fatalf("Expected %q, got %q.",
+				http.StatusText(http.StatusOK), http.StatusText(r.StatusCode))
+		}
+
+		var resp todoResponse
+		if err := json.NewDecoder(r.Body).Decode(&resp); err != nil {
+			t.Fatal(err)
+		}
+		r.Body.Close()
+
+		if len(resp.Results) != 1 {
+			t.Errorf("Expected 1 item, got %d.", len(resp.Results))
+		}
+
+		expTask := "Task number 2."
+		if resp.Results[0].Task != expTask {
+			t.Errorf("Expected %q, got %q.", expTask, resp.Results[0].Task)
+		}
+	})
+}
+
+func TestComplete(t *testing.T) {
+	url, cleanup := setupAPI(t)
+	defer cleanup()
+
+	t.Run("Complete", func(t *testing.T) {
+		u := fmt.Sprintf("%s/todo/1?complete", url)
+		req, err := http.NewRequest(http.MethodPatch, u, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		r, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Error(err)
+		}
+
+		if r.StatusCode != http.StatusNoContent {
+			t.Fatalf("Expected %q, got %q.",
+				http.StatusText(http.StatusNoContent), http.StatusText(r.StatusCode))
+		}
+	})
+
+	t.Run("CheckComplete", func(t *testing.T) {
+		r, err := http.Get(url + "/todo")
+		if err != nil {
+			t.Error(err)
+		}
+
+		if r.StatusCode != http.StatusOK {
+			t.Fatalf("Expected %q, got %q.",
+				http.StatusText(http.StatusOK), http.StatusText(r.StatusCode))
+		}
+
+		var resp todoResponse
+		if err := json.NewDecoder(r.Body).Decode(&resp); err != nil {
+			t.Fatal(err)
+		}
+		r.Body.Close()
+		if len(resp.Results) != 2 {
+			t.Errorf("Expected 2 items, got %d.", len(resp.Results))
+		}
+
+		if !resp.Results[0].Done {
+			t.Error("Expected Item 1 to be completed")
+		}
+
+		if resp.Results[1].Done {
+			t.Error("Expected Item 2 not to be completed")
+		}
+	})
+}
+
 // setupAPI creates a new test server and returns its URL and a cleanup function
 func setupAPI(t *testing.T) (string, func()) {
 	t.Helper()
+	//update the set-up to include a test to-do file and few items for testing
 
-	testSrv := httptest.NewServer(newMux(""))
+	tempTodoFile, err := os.CreateTemp("", "todotest")
+	if err != nil {
+		t.Fatal(err)
+	}
 
+	//create a new test server with the test to-do file
+	testSrv := httptest.NewServer(newMux(tempTodoFile.Name()))
+
+	//hard coded test items
+	for i := 1; i < 3; i++ {
+		var body bytes.Buffer
+		taskName := fmt.Sprintf("Task number %d.", i)
+		item := struct {
+			Task string `json:"task"`
+		}{
+			Task: taskName,
+		}
+
+		if err := json.NewEncoder(&body).Encode(item); err != nil {
+			t.Fatal(err)
+		}
+		//post the test items to the test server at the /todo endpoint
+		r, err := http.Post(testSrv.URL+"/todo", "application/json", &body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.StatusCode != http.StatusCreated {
+			t.Fatalf("Expected %q, got %q.", http.StatusText(http.StatusCreated), http.StatusText(r.StatusCode))
+		}
+	}
 	return testSrv.URL, func() {
 		testSrv.Close()
+		if err := os.Remove(tempTodoFile.Name()); err != nil {
+			t.Error(err)
+		}
 	}
 }
